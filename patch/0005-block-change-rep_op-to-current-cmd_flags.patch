@@ -1,0 +1,25 @@
+From 09640772111aa8aeed54b756a5062fc41513b28c Mon Sep 17 00:00:00 2001
+From: Jeff Xie <huan.xie@suse.com>
+Date: Mon, 19 Oct 2020 23:46:46 +0800
+Subject: [PATCH] block: change rep_op to current cmd_flags
+
+---
+ drivers/block/test_blk.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/block/test_blk.c b/drivers/block/test_blk.c
+index ce41148..d65dc22 100644
+--- a/drivers/block/test_blk.c
++++ b/drivers/block/test_blk.c
+@@ -829,7 +829,7 @@ static int testb_handle_rq(struct request *rq)
+ 		len = bvec.bv_len;
+ 		err = testb_transfer(testb, bvec.bv_page, len, bvec.bv_offset,
+ 				     op_is_write(req_op(rq)), sector,
+-				     &lock_flag, req_op(rq) & REQ_FUA);
++				     &lock_flag, rq->cmd_flags & REQ_FUA);
+ 		if (err) {
+ 			spin_unlock_irqrestore(&testb->t_dev->lock, lock_flag);
+ 			return err;
+-- 
+1.8.3.1
+

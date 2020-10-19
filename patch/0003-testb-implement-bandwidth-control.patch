@@ -1,0 +1,244 @@
+From 85062e6663469022e62c48e8fc0e8759cf819433 Mon Sep 17 00:00:00 2001
+From: Kyungchan Koh <kkc6196@fb.com>
+Date: Sat, 5 Aug 2017 08:51:47 -0700
+Subject: [PATCH 3/4] testb: implement bandwidth control
+
+In test, we usually expect controllable disk speed. For example, in a
+raid array, we'd like some disks are fast and some are slow. MD RAID
+actually has a feature for this. To test the feature, we'd like to make
+the disk run in specific speed.
+
+block throttling probably can be used for this purpose, but it requires
+cgroup setup. Here we just implement a simple throttling mechanism in
+the driver. There is slight fluctuation in the mechanism, but it's good
+enough for test.
+
+Signed-off-by: Kyungchan Koh <kkc6196@fb.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+---
+ drivers/block/test_blk.c | 104 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 103 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/block/test_blk.c b/drivers/block/test_blk.c
+index f0aad9d..048a0af 100644
+--- a/drivers/block/test_blk.c
++++ b/drivers/block/test_blk.c
+@@ -9,9 +9,11 @@
+ 
+ #include <linux/init.h>
+ #include <linux/module.h>
++#include <linux/atomic.h>
+ #include <linux/blk-mq.h>
+ #include <linux/blkdev.h>
+ #include <linux/configfs.h>
++#include <linux/hrtimer.h>
+ #include <linux/radix-tree.h>
+ #include <linux/idr.h>
+ 
+@@ -23,6 +25,14 @@
+ 
+ #define FREE_BATCH		16
+ 
++#define TICKS_PER_SEC		50ULL
++#define TIMER_INTERVAL		(NSEC_PER_SEC / TICKS_PER_SEC)
++
++static inline u64 mb_per_tick(int mbps)
++{
++	return (1 << 20) / TICKS_PER_SEC * ((u64) mbps);
++}
++
+ struct testb {
+ 	unsigned int index;
+ 	struct request_queue *q;
+@@ -33,6 +43,9 @@ struct testb {
+ 	struct blk_mq_tag_set tag_set;
+ 
+ 	char disk_name[DISK_NAME_LEN];
++
++	atomic_long_t cur_bytes;
++	struct hrtimer timer;
+ };
+ 
+ /*
+@@ -53,10 +66,12 @@ struct testb_page {
+  *
+  * CONFIGURED:	Device has been configured and turned on. Cannot reconfigure.
+  * UP:		Device is currently on and visible in userspace.
++ * THROTTLED:	Device is being throttled.
+  */
+ enum testb_device_flags {
+ 	TESTB_DEV_FL_CONFIGURED	= 0,
+ 	TESTB_DEV_FL_UP		= 1,
++	TESTB_DEV_FL_THROTTLED	= 2,
+ };
+ 
+ /*
+@@ -74,6 +89,7 @@ enum testb_device_flags {
+  * @nr_queues:	The number of queues.
+  * @q_depth:	The depth of each queue.
+  * @discard:	If enable discard
++ * @mbps:	Bandwidth throttle cap (in mb/s).
+  */
+ struct testb_device {
+ 	struct config_item item;
+@@ -88,6 +104,7 @@ struct testb_device {
+ 	uint nr_queues;
+ 	uint q_depth;
+ 	uint discard;
++	uint mbps;
+ };
+ 
+ static int testb_poweron_device(struct testb_device *dev);
+@@ -161,6 +178,7 @@ static inline ssize_t testb_device_u64_attr_show(u64 val, char *page)
+ TESTB_DEVICE_ATTR(nr_queues, uint);
+ TESTB_DEVICE_ATTR(q_depth, uint);
+ TESTB_DEVICE_ATTR(discard, uint);
++TESTB_DEVICE_ATTR(mbps, uint);
+ 
+ static ssize_t testb_device_power_show(struct config_item *item, char *page)
+ {
+@@ -207,6 +225,7 @@ static ssize_t testb_device_power_store(struct config_item *item,
+ 	&testb_device_attr_nr_queues,
+ 	&testb_device_attr_q_depth,
+ 	&testb_device_attr_discard,
++	&testb_device_attr_mbps,
+ 	NULL,
+ };
+ 
+@@ -247,6 +266,7 @@ config_item *testb_group_make_item(struct config_group *group, const char *name)
+ 	t_dev->nr_queues = 2;
+ 	t_dev->q_depth = 64;
+ 	t_dev->discard = 1;
++	t_dev->mbps = -1;
+ 
+ 	return &t_dev->item;
+ }
+@@ -265,7 +285,7 @@ config_item *testb_group_make_item(struct config_group *group, const char *name)
+ 
+ static ssize_t memb_group_features_show(struct config_item *item, char *page)
+ {
+-	return snprintf(page, PAGE_SIZE, "\n");
++	return snprintf(page, PAGE_SIZE, "bandwidth\n");
+ }
+ 
+ CONFIGFS_ATTR_RO(memb_group_, features);
+@@ -299,6 +319,11 @@ static ssize_t memb_group_features_show(struct config_item *item, char *page)
+ static DEFINE_MUTEX(testb_lock);
+ static int testb_major;
+ 
++static inline int testb_throttled(struct testb *testb)
++{
++	return test_bit(TESTB_DEV_FL_THROTTLED, &testb->t_dev->flags);
++}
++
+ static struct testb_page *testb_alloc_page(gfp_t gfp_flags)
+ {
+ 	struct testb_page *t_page;
+@@ -570,6 +595,44 @@ static int testb_handle_rq(struct request *rq)
+ 	} else if (req_op(rq) == REQ_OP_FLUSH)
+ 		return testb_handle_flush(testb);
+ 
++	len = blk_rq_bytes(rq);
++	if (testb_throttled(testb)) {
++		if (!hrtimer_active(&testb->timer))
++			hrtimer_restart(&testb->timer);
++
++		/*
++		 * The lock is taken here to ensure no race happens
++		 * between the timer that a) resets the budget and
++		 * b) starts the queue and the cmd handler that
++		 * c) spends the budget and d) determines to stop
++		 * the queue.
++		 *
++		 * The race happens when the processes interweave.
++		 * For example, c, a, b, d. For a whole interval,
++		 * there may be no I/O occurring due to the race.
++		 *
++		 * Solution: Create an isolated region using the
++		 * device spinlock that ensure a and b occur in
++		 * isolation to c and d such that no interweaving
++		 * occurs.
++		 *
++		 * This also prevents multiple processes or threads from
++		 * calling blk_mq_stop_hw_queues.
++		 */
++		spin_lock_irqsave(&testb->t_dev->lock, lock_flag);
++
++		if (atomic_long_add_negative((int)(-1 * len),
++						&testb->cur_bytes)) {
++			if (!blk_mq_queue_stopped(testb->q))
++				blk_mq_stop_hw_queues(testb->q);
++
++			spin_unlock_irqrestore(&testb->t_dev->lock, lock_flag);
++			/* requeue the request */
++			return -ENOMEM;
++		}
++		spin_unlock_irqrestore(&testb->t_dev->lock, lock_flag);
++	}
++
+ 	spin_lock_irqsave(&testb->t_dev->lock, lock_flag);
+ 	rq_for_each_segment(bvec, rq, iter) {
+ 		len = bvec.bv_len;
+@@ -622,6 +685,8 @@ static void testb_free_bdev(struct testb *testb)
+ 	ida_simple_remove(&testb_indices, testb->index);
+ 	mutex_unlock(&testb_lock);
+ 
++	if (testb_throttled(testb))
++		hrtimer_cancel(&testb->timer);
+ 	blk_cleanup_queue(testb->q);
+ 	blk_mq_free_tag_set(&testb->tag_set);
+ 
+@@ -656,6 +721,37 @@ static void testb_config_flush(struct testb *testb)
+ 	blk_queue_write_cache(testb->q, true, true);
+ }
+ 
++static enum hrtimer_restart testb_timer_fn(struct hrtimer *timer)
++{
++	struct testb *testb = container_of(timer, struct testb, timer);
++	ktime_t testb_timer_interval = ktime_set(0, TIMER_INTERVAL);
++	int testb_mbps = testb->t_dev->mbps;
++	unsigned long lock_flag;
++
++	if (atomic_long_read(&testb->cur_bytes) == mb_per_tick(testb_mbps))
++		return HRTIMER_NORESTART;
++
++	spin_lock_irqsave(&testb->t_dev->lock, lock_flag);
++	atomic_long_set(&testb->cur_bytes, mb_per_tick(testb_mbps));
++	if (blk_mq_queue_stopped(testb->q))
++		blk_mq_start_stopped_hw_queues(testb->q, true);
++	spin_unlock_irqrestore(&testb->t_dev->lock, lock_flag);
++
++	hrtimer_forward_now(&testb->timer, testb_timer_interval);
++
++	return HRTIMER_RESTART;
++}
++
++static void testb_setup_timer(struct testb *testb)
++{
++	ktime_t testb_timer_interval = ktime_set(0, TIMER_INTERVAL);
++
++	hrtimer_init(&testb->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
++	testb->timer.function = &testb_timer_fn;
++	atomic_long_set(&testb->cur_bytes, mb_per_tick(testb->t_dev->mbps));
++	hrtimer_start(&testb->timer, testb_timer_interval, HRTIMER_MODE_ABS);
++}
++
+ static int testb_gendisk_register(struct testb *testb)
+ {
+ 	sector_t size;
+@@ -720,6 +816,12 @@ static int testb_alloc_bdev(struct testb_device *t_dev)
+ 		goto out_cleanup_tags;
+ 	}
+ 
++	if (t_dev->mbps && t_dev->mbps != -1) {
++		t_dev->mbps = (t_dev->mbps >> 10) > 0 ? 1024 : t_dev->mbps;
++		set_bit(TESTB_DEV_FL_THROTTLED, &t_dev->flags);
++		testb_setup_timer(testb);
++	}
++
+ 	testb->q->queuedata = testb;
+ 	blk_queue_flag_set(QUEUE_FLAG_NONROT, testb->q);
+ 	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, testb->q);
+-- 
+1.8.3.1
+

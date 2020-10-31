@@ -829,7 +829,7 @@ static int testb_handle_rq(struct request *rq)
 		len = bvec.bv_len;
 		err = testb_transfer(testb, bvec.bv_page, len, bvec.bv_offset,
 				     op_is_write(req_op(rq)), sector,
-				     &lock_flag, req_op(rq) & REQ_FUA);
+				     &lock_flag, rq->cmd_flags & REQ_FUA);
 		if (err) {
 			spin_unlock_irqrestore(&testb->t_dev->lock, lock_flag);
 			return err;
